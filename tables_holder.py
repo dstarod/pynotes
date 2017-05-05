@@ -1,13 +1,21 @@
 """
 Class for backup and restore customer tables from PostgreSQL database using SQLAlchemy engine
+
+How to use:
+backup = TablesHolder(engine=engine)
+backup.backup()
+backup.restore()
 """
+from tempfile import NamedTemporaryFile
 
 
 class TablesHolder(object):
-    def __init__(self, engine, backup_dir):
+    def __init__(self, engine):
         self.engine = engine
-        self.backup_dir = backup_dir
+        self.files_path = {}
+        self.connection = None
         self._table_list = []
+        self.sequences = {}
 
     @property
     def table_list(self):
@@ -25,48 +33,76 @@ class TablesHolder(object):
 
     def _disable_triggers(self):
         for table_name in self.table_list:
-            self.engine.execute(
+            self.connection.execute(
                 'ALTER TABLE {} DISABLE TRIGGER ALL'.format(table_name)
             )
 
     def _enable_triggers(self):
         for table_name in self.table_list:
-            self.engine.execute(
+            self.connection.execute(
                 'ALTER TABLE {} ENABLE TRIGGER ALL'.format(table_name)
             )
 
-    def _backup_table(self, table_name):
-        file_name = os.path.join(
-            self.backup_dir, '{}.csv'.format(table_name)
-        )
-        self.engine.execute(
-            "COPY {} TO '{}' WITH CSV;".format(table_name, file_name)
-        )
+    def _truncate_tables(self):
+        for table_name in self.table_list:
+            self.connection.execute(
+                'TRUNCATE TABLE {0} CASCADE;'.format(table_name)
+            )
 
-    def _restore_table(self, table_name):
-        file_name = os.path.join(
-            self.backup_dir, '{}.csv'.format(table_name)
-        )
-        self.engine.execute(
-            """
-            BEGIN;
-                TRUNCATE TABLE {0} CASCADE ;
-                COPY {0} FROM '{1}' WITH CSV;
-            COMMIT;
-            """.format(table_name,file_name)
-        )
+    def _backup_tables(self):
+        for table_name in self.table_list:
+            self.files_path[table_name] = NamedTemporaryFile(mode='w+')
+            self.connection.execute(
+                "COPY {} TO '{}' WITH CSV;".format(
+                    table_name, self.files_path[table_name].name
+                )
+            )
+
+    def _backup_sequences(self):
+        seq_sql = """
+        SELECT sequence_schema || '.' || sequence_name
+        FROM information_schema.sequences
+        """
+        for sequence_name in self.connection.execute(seq_sql):
+            sequence_name = sequence_name[0]
+            sql = "SELECT last_value FROM {}".format(sequence_name)
+            value = self.connection.execute(sql).fetchone()
+            self.sequences[sequence_name] = value[0]
+
+    def _restore_tables(self):
+        for table_name in self.table_list:
+            self.connection.execute(
+                "COPY {0} FROM '{1}' WITH CSV;".format(
+                    table_name, self.files_path[table_name].name
+                )
+            )
+
+    def _restore_sequences(self):
+        for seq_name, seq_value in self.sequences.items():
+            self.connection.execute(
+                "SELECT setval('{}', {});".format(seq_name, seq_value)
+            )
 
     def backup(self):
-        for table_name in self.table_list:
-            self._backup_table(table_name)
+        self.connection = self.engine.connect()
+        try:
+            self._backup_sequences()
+            self._backup_tables()
+        finally:
+            self.connection.close()
 
     def restore(self):
-        self._disable_triggers()
-        for table_name in self.table_list:
-            self._restore_table(table_name)
-        self._enable_triggers()
-
-
-backup = TablesHolder(engine=engine, backup_dir='/path/to/dir')
-backup.backup()
-backup.restore()
+        self.connection = self.engine.connect()
+        trans = self.connection.begin()
+        try:
+            self._disable_triggers()
+            self._truncate_tables()
+            self._restore_tables()
+            self._restore_sequences()
+            self._enable_triggers()
+            trans.commit()
+        except Exception as e:
+            trans.rollback()
+            raise e
+        finally:
+            self.connection.close()
