@@ -1,1 +1,1 @@
-# pynotes
+# Python memos
